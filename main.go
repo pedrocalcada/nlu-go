@@ -101,8 +101,8 @@ func main() {
 		fmt.Printf("Intenção prevista: %s (score: %.4f)\n", intent, score)
 
 		// 4) Extrair entidades
-		// ents := ExtractEntities(req.Message)
-		// fmt.Printf("Entidades: %+v\n", ents)
+		ents := ExtractEntities(req.Message)
+		fmt.Printf("Entidades: %+v\n", ents)
 	})
 
 	log.Println("Server running on :8081")
