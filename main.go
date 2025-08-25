@@ -3,125 +3,496 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"flag"
 	"fmt"
-	"io"
 	"log"
 	"math"
 	"math/rand"
-	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 )
 
+// ===================== Dataset de exemplo =====================
+
 type Sample struct {
-	Text   string `json:"text"`
-	Intent string `json:"intent"`
+	Text  string `json:"text"`
+	Label string `json:"intent"`
 }
 
-type NBModel struct {
-	Classes            []string                  `json:"classes"`
-	ClassCounts        map[string]int            `json:"class_counts"`
-	TokenCounts        map[string]map[string]int `json:"token_counts"` // class -> token -> count
-	Vocab              map[string]struct{}       `json:"vocab"`
-	TotalTokensByClass map[string]int            `json:"total_tokens_by_class"`
-	Laplace            float64                   `json:"laplace"`
-	Stopwords          map[string]struct{}       `json:"stopwords"`
+// ===================== Tokenização & n-grams =====================
+
+var splitRe = regexp.MustCompile(`[^\p{L}\p{N}]+`)
+
+func tokenize(s string) []string {
+	s = strings.ToLower(s)
+	parts := splitRe.Split(s, -1)
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
-type ChatRequest struct {
-	Message string `json:"message"`
+// 1-gram + 2-grams
+func ngrams(tokens []string) []string {
+	if len(tokens) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(tokens)*2)
+	out = append(out, tokens...) // unigrams
+	for i := 0; i+1 < len(tokens); i++ {
+		out = append(out, tokens[i]+"_"+tokens[i+1])
+	}
+	return out
 }
+
+// ===================== Vocabulário + TF-IDF =====================
+
+type Vocab struct {
+	Index map[string]int `json:"index"`
+	Words []string       `json:"words"`
+	IDF   []float32      `json:"idf"`
+}
+
+func buildVocabTFIDF(texts []string, minDF int) Vocab {
+	df := map[string]int{}
+	for _, t := range texts {
+		toks := ngrams(tokenize(t))
+		seen := map[string]bool{}
+		for _, tok := range toks {
+			if !seen[tok] {
+				df[tok]++
+				seen[tok] = true
+			}
+		}
+	}
+	words := make([]string, 0, len(df))
+	for w, c := range df {
+		if c >= minDF {
+			words = append(words, w)
+		}
+	}
+	sort.Strings(words)
+	index := make(map[string]int, len(words))
+	for i, w := range words {
+		index[w] = i
+	}
+	N := float64(len(texts))
+	idf := make([]float32, len(words))
+	for i, w := range words {
+		d := float64(df[w])
+		idf[i] = float32(math.Log((N+1.0)/(d+1.0)) + 1.0)
+	}
+	return Vocab{Index: index, Words: words, IDF: idf}
+}
+
+// Vetor esparso (índices + valores)
+type SparseVec struct {
+	Idx []int
+	Val []float32
+}
+
+func vectorizeTFIDF_Sparse(v Vocab, text string, l2normalize bool) SparseVec {
+	counts := map[int]float32{}
+	for _, tok := range ngrams(tokenize(text)) {
+		if j, ok := v.Index[tok]; ok {
+			counts[j] += 1.0
+		}
+	}
+	if len(counts) == 0 {
+		return SparseVec{}
+	}
+	// aplica IDF
+	var idx []int
+	var val []float32
+	for j, tf := range counts {
+		x := tf * v.IDF[j]
+		idx = append(idx, j)
+		val = append(val, x)
+	}
+	// normalização L2
+	if l2normalize {
+		var norm float32
+		for _, x := range val {
+			norm += x * x
+		}
+		if norm > 0 {
+			n := float32(math.Sqrt(float64(norm)))
+			for i := range val {
+				val[i] /= n
+			}
+		}
+	}
+	// manter índices ordenados (opcional)
+	sort.Slice(idx, func(i, j int) bool { return idx[i] < idx[j] })
+	// reordenar valores conforme idx
+	tmp := make([]float32, len(val))
+	copy(tmp, val)
+	pos := make(map[int]int, len(idx))
+	for k, j := range idx {
+		pos[j] = k
+	}
+	for j, tf := range counts {
+		k := sort.SearchInts(idx, j)
+		tmp[k] = tf * v.IDF[j] // já normalizado acima
+	}
+	return SparseVec{Idx: idx, Val: val}
+}
+
+// ===================== Split & métricas =====================
+
+func trainTestSplit(samples []Sample, testRatio float64, seed int64) (train, test []Sample) {
+	r := rand.New(rand.NewSource(seed))
+	shuffled := make([]Sample, len(samples))
+	copy(shuffled, samples)
+	r.Shuffle(len(shuffled), func(i, j int) { shuffled[i], shuffled[j] = shuffled[j], shuffled[i] })
+	nTest := int(float64(len(shuffled)) * testRatio)
+	test = shuffled[:nTest]
+	train = shuffled[nTest:]
+	return
+}
+
+func uniqueLabels(samples []Sample) []string {
+	seen := map[string]bool{}
+	for _, s := range samples {
+		seen[s.Label] = true
+	}
+	var labels []string
+	for k := range seen {
+		labels = append(labels, k)
+	}
+	sort.Strings(labels)
+	return labels
+}
+
+func accuracy(yTrue, yPred []string) float64 {
+	if len(yTrue) != len(yPred) {
+		log.Fatal("tamanhos incompatíveis")
+	}
+	c := 0
+	for i := range yTrue {
+		if yTrue[i] == yPred[i] {
+			c++
+		}
+	}
+	return float64(c) / float64(len(yTrue))
+}
+
+// ===================== Regressão Logística Multiclasse (Softmax) =====================
+
+type SoftmaxModel struct {
+	Labels []string    `json:"labels"`
+	W      [][]float32 `json:"W"` // [C][D]
+	B      []float32   `json:"B"` // [C]
+}
+
+func newSoftmax(labels []string, dim int, seed int64) *SoftmaxModel {
+	r := rand.New(rand.NewSource(seed))
+	W := make([][]float32, len(labels))
+	for c := range W {
+		W[c] = make([]float32, dim)
+		for j := 0; j < dim; j++ {
+			W[c][j] = float32((r.Float64()*2 - 1) * 0.01)
+		}
+	}
+	B := make([]float32, len(labels))
+	return &SoftmaxModel{Labels: labels, W: W, B: B}
+}
+
+func dotSparse(w []float32, x SparseVec) float32 {
+	var s float32
+	for k, j := range x.Idx {
+		s += w[j] * x.Val[k]
+	}
+	return s
+}
+
+func (m *SoftmaxModel) predictOne(x SparseVec) string {
+	if len(m.Labels) == 0 {
+		return ""
+	}
+	C := len(m.Labels)
+	logits := make([]float32, C)
+	var maxLogit float32 = -1e30
+	for c := 0; c < C; c++ {
+		z := dotSparse(m.W[c], x) + m.B[c]
+		logits[c] = z
+		if z > maxLogit {
+			maxLogit = z
+		}
+	}
+	// softmax (estável)
+	var sum float32
+	for c := 0; c < C; c++ {
+		logits[c] = float32(math.Exp(float64(logits[c] - maxLogit)))
+		sum += logits[c]
+	}
+	best := 0
+	bestVal := float32(-1)
+	for c := 0; c < C; c++ {
+		p := logits[c] / sum
+		if p > bestVal {
+			bestVal = p
+			best = c
+		}
+	}
+	return m.Labels[best]
+}
+
+// Treino SGD mini-batch com weight decay (L2)
+type TrainCfg struct {
+	LR          float32 // learning rate
+	L2          float32 // weight decay
+	Epochs      int
+	BatchSize   int
+	Patience    int // early stopping (épocas sem melhora)
+	ValSplit    float64
+	Seed        int64
+	L2Normalize bool
+}
+
+func trainSoftmax(cfg TrainCfg, labels []string, vocab Vocab, train []Sample) (*SoftmaxModel, float64) {
+	// split train/val
+	r := rand.New(rand.NewSource(cfg.Seed))
+	shuf := make([]Sample, len(train))
+	copy(shuf, train)
+	r.Shuffle(len(shuf), func(i, j int) { shuf[i], shuf[j] = shuf[j], shuf[i] })
+	nVal := int(float64(len(shuf)) * cfg.ValSplit)
+	val := shuf[:nVal]
+	tr := shuf[nVal:]
+
+	// vetorização esparsa
+	X := make([]SparseVec, len(tr))
+	Y := make([]int, len(tr))
+	Lmap := map[string]int{}
+	for i, lb := range labels {
+		Lmap[lb] = i
+	}
+	for i, s := range tr {
+		X[i] = vectorizeTFIDF_Sparse(vocab, s.Text, cfg.L2Normalize)
+		Y[i] = Lmap[s.Label]
+	}
+	Xv := make([]SparseVec, len(val))
+	Yv := make([]int, len(val))
+	for i, s := range val {
+		Xv[i] = vectorizeTFIDF_Sparse(vocab, s.Text, cfg.L2Normalize)
+		Yv[i] = Lmap[s.Label]
+	}
+
+	// C := len(labels)
+	D := len(vocab.Words)
+	m := newSoftmax(labels, D, cfg.Seed)
+
+	indices := make([]int, len(X))
+	for i := range indices {
+		indices[i] = i
+	}
+
+	bestValAcc := -1.0
+	best := *m
+	noImprove := 0
+
+	for epoch := 0; epoch < cfg.Epochs; epoch++ {
+		r.Shuffle(len(indices), func(i, j int) { indices[i], indices[j] = indices[j], indices[i] })
+
+		for start := 0; start < len(indices); start += cfg.BatchSize {
+			end := start + cfg.BatchSize
+			if end > len(indices) {
+				end = len(indices)
+			}
+
+			// Weight decay (aplicado só nos pesos tocados)
+			batch := indices[start:end]
+			for _, i := range batch {
+				x := X[i]
+				y := Y[i]
+
+				// logits
+				Cs := len(m.Labels)
+				logits := make([]float32, Cs)
+				var maxz float32 = -1e30
+				for c := 0; c < Cs; c++ {
+					z := dotSparse(m.W[c], x) + m.B[c]
+					logits[c] = z
+					if z > maxz {
+						maxz = z
+					}
+				}
+				// softmax
+				var sum float32
+				for c := 0; c < Cs; c++ {
+					logits[c] = float32(math.Exp(float64(logits[c] - maxz)))
+					sum += logits[c]
+				}
+				// Gradiente e atualização por amostra (SGD)
+				for c := 0; c < Cs; c++ {
+					p := logits[c] / sum
+					grad := p
+					if c == y {
+						grad -= 1.0
+					}
+					// bias
+					m.B[c] -= cfg.LR * grad
+					// pesos esparsos + L2 local
+					for k, j := range x.Idx {
+						g := grad * x.Val[k]
+						// weight decay (L2) tocando apenas dimensões usadas
+						m.W[c][j] = m.W[c][j]*(1.0-cfg.LR*cfg.L2) - cfg.LR*g
+					}
+				}
+			}
+		}
+
+		// validação
+		acc := evalAcc(m, Xv, Yv)
+		// fmt.Printf("epoch %d  val_acc=%.4f\n", epoch+1, acc)
+		if acc > bestValAcc {
+			bestValAcc = acc
+			best = *m
+			noImprove = 0
+		} else {
+			noImprove++
+			if noImprove >= cfg.Patience {
+				break
+			}
+		}
+	}
+	*m = best
+	return m, bestValAcc
+}
+
+func evalAcc(m *SoftmaxModel, X []SparseVec, Y []int) float64 {
+	if len(X) == 0 {
+		return 0
+	}
+	ok := 0
+	for i := range X {
+		lbl := m.predictOne(X[i])
+		if lbl == m.Labels[Y[i]] {
+			ok++
+		}
+	}
+	return float64(ok) / float64(len(X))
+}
+
+// ===================== Modelo serializável =====================
+
+type FullModel struct {
+	Labels      []string      `json:"labels"`
+	Vocab       Vocab         `json:"vocab"`
+	SM          *SoftmaxModel `json:"softmax"`
+	L2Normalize bool          `json:"l2_normalize"`
+}
+
+func saveModel(path string, fm *FullModel) error {
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	enc := json.NewEncoder(f)
+	enc.SetIndent("", "  ")
+	return enc.Encode(fm)
+}
+
+func loadModel(path string) (*FullModel, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	var fm FullModel
+	if err := json.NewDecoder(f).Decode(&fm); err != nil {
+		return nil, err
+	}
+	return &fm, nil
+}
+
+// ===================== Main =====================
 
 func main() {
-	// rand.Seed(time.Now().UnixNano())
+	predictText := flag.String("predict", "", "Texto para predição usando model.json")
+	modelPath := flag.String("model", "model.json", "Caminho do modelo salvo/carregado")
+	flag.Parse()
 
-	dataPath := "dataset.jsonl"
-	samples, err := loadJSONL(dataPath)
-	if err != nil {
-		log.Fatalf("falha ao carregar dataset: %v", err)
+	if *predictText != "" {
+		fm, err := loadModel(*modelPath)
+		if err != nil {
+			log.Fatalf("erro ao carregar modelo: %v", err)
+		}
+		x := vectorizeTFIDF_Sparse(fm.Vocab, *predictText, fm.L2Normalize)
+		fmt.Printf("Texto: %q\nPredição => %s\n", *predictText, fm.SM.predictOne(x))
+		return
 	}
 
-	// embaralha e split 80/20
-	rand.Shuffle(len(samples), func(i, j int) { samples[i], samples[j] = samples[j], samples[i] })
-	trainSize := int(float64(len(samples)) * 0.8)
-	train := samples[:trainSize]
-	test := samples[trainSize:]
+	// Treino
+	samples, _ := loadJSONL("dataset.jsonl")
+	train, test := trainTestSplit(samples, 0.2, 42)
+	labels := uniqueLabels(samples)
 
-	stop := buildStopwords()
-	model := TrainNB(train, 1.0, stop) // Laplace=1.0
+	// Vocab com TF-IDF (minDF=1 para exemplo)
+	var trainTexts []string
+	for _, s := range train {
+		trainTexts = append(trainTexts, s.Text)
+	}
+	vocab := buildVocabTFIDF(trainTexts, 1)
+	l2normalize := true
 
-	acc, cm := Evaluate(model, test)
-	fmt.Printf("Accuracy: %.4f\n", acc)
-	fmt.Println("Matriz de confusão:")
-	printConfusion(cm)
+	// Config mais rápida
+	cfg := TrainCfg{
+		LR:          0.2,
+		L2:          1e-4,
+		Epochs:      40,
+		BatchSize:   256,
+		Patience:    5,
+		ValSplit:    0.15,
+		Seed:        time.Now().Unix(),
+		L2Normalize: l2normalize,
+	}
 
-	// salva modelo
-	if err := saveModel("model.json", model); err != nil {
+	model, _ := trainSoftmax(cfg, labels, vocab, train)
+
+	// Avaliação em teste
+	Xte := make([]SparseVec, len(test))
+	Yte := make([]string, len(test))
+	for i, s := range test {
+		Xte[i] = vectorizeTFIDF_Sparse(vocab, s.Text, l2normalize)
+		Yte[i] = s.Label
+	}
+	pred := make([]string, len(test))
+	for i := range Xte {
+		pred[i] = model.predictOne(Xte[i])
+	}
+	acc := accuracy(Yte, pred)
+
+	fmt.Println("Labels:", labels)
+	fmt.Printf("Vocab size (1-gram+2-gram): %d\n", len(vocab.Words))
+	fmt.Printf("Acurácia (teste): %.2f\n", acc)
+
+	// Exemplos rápidos
+	tests := []string{
+		"meu limite diário do pix está baixo, aumenta para 800",
+		"qual meu saldo disponível agora?",
+		"envie 70 reais para a chave 11988887777",
+	}
+	for _, t := range tests {
+		x := vectorizeTFIDF_Sparse(vocab, t, l2normalize)
+		fmt.Printf("\nFrase: %q\n => %s\n", t, model.predictOne(x))
+	}
+
+	// Salvar
+	fm := &FullModel{Labels: labels, Vocab: vocab, SM: model, L2Normalize: l2normalize}
+	if err := saveModel("model.json", fm); err != nil {
 		log.Fatalf("erro ao salvar modelo: %v", err)
 	}
-	fmt.Println("Modelo salvo em model.json")
-
-	// exemplo de inferência
-	ex := "envie 70 reais para a chave do carlos"
-	intent, score := Predict(model, ex)
-	fmt.Printf("Exemplo => \"%s\" -> intent=%s (score=%.4f)\n", ex, intent, score)
-
-	// extração de entidades simples (ex.: valor, telefone, e-mail, CPF/CNPJ)
-	ents := ExtractEntities(ex)
-	fmt.Printf("Entidades: %+v\n", ents)
-
-	http.HandleFunc("/predict", func(w http.ResponseWriter, r *http.Request) {
-		model, err := loadModel("model.json")
-		if err != nil {
-			panic(err)
-		}
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			http.Error(w, "Failed to read body", http.StatusBadRequest)
-			return
-		}
-		var req ChatRequest
-		if err := json.Unmarshal(body, &req); err != nil {
-			http.Error(w, "Invalid JSON", http.StatusBadRequest)
-			return
-		}
-
-		cls, p, margin, dist := PredictProba(model, req.Message)
-		fmt.Printf("classe=%s prob=%.3f margin=%.2f dist=%v\n", cls, p, margin, dist)
-
-		intent, score := Predict(model, req.Message)
-		fmt.Printf("Texto: %q\n", req.Message)
-		fmt.Printf("Intenção prevista: %s (score: %.4f)\n", intent, score)
-
-		// 4) Extrair entidades
-		ents := ExtractEntities(req.Message)
-		fmt.Printf("Entidades: %+v\n", ents)
-	})
-
-	log.Println("Server running on :8081")
-	log.Fatal(http.ListenAndServe(":8081", nil))
+	fmt.Println("\nModelo salvo em model.json")
 }
-
-func loadModel(path string) (*NBModel, error) {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	var m NBModel
-	if err := json.Unmarshal(b, &m); err != nil {
-		return nil, err
-	}
-	return &m, nil
-}
-
-// -------------------- IO --------------------
 
 func loadJSONL(path string) ([]Sample, error) {
 	b, err := os.ReadFile(filepath.Clean(path))
@@ -145,7 +516,7 @@ func loadJSONL(path string) ([]Sample, error) {
 		// filtra entradas vazias
 		out := make([]Sample, 0, len(arr))
 		for i, s := range arr {
-			if strings.TrimSpace(s.Text) == "" || strings.TrimSpace(s.Intent) == "" {
+			if strings.TrimSpace(s.Text) == "" || strings.TrimSpace(s.Label) == "" {
 				continue
 			}
 			out = append(out, s)
@@ -154,315 +525,6 @@ func loadJSONL(path string) ([]Sample, error) {
 		return out, nil
 	}
 
-	// 2) Caso contrário, trata como JSONL (uma linha por objeto)
-	lines := strings.Split(string(b), "\n")
-	out := make([]Sample, 0, len(lines))
-	for i, raw := range lines {
-		lineno := i + 1
-		line := strings.TrimSpace(strings.TrimRight(raw, "\r"))
-		if line == "" {
-			continue // pula linhas vazias
-		}
-		var s Sample
-		if err := json.Unmarshal([]byte(line), &s); err != nil {
-			// Mostra um trecho da linha para facilitar o debug
-			snippet := line
-			if len(snippet) > 160 {
-				snippet = snippet[:160] + "...(truncado)"
-			}
-			return nil, fmt.Errorf("linha %d inválida: %v\nconteúdo: %q", lineno, err, snippet)
-		}
-		// valida campos obrigatórios
-		if strings.TrimSpace(s.Text) == "" || strings.TrimSpace(s.Intent) == "" {
-			return nil, fmt.Errorf("linha %d: campos obrigatórios vazios (text/intent)", lineno)
-		}
-		out = append(out, s)
-	}
+	return nil, fmt.Errorf("nenhum exemplo válido encontrado (arquivo pode conter apenas linhas vazias)")
 
-	if len(out) == 0 {
-		return nil, fmt.Errorf("nenhum exemplo válido encontrado (arquivo pode conter apenas linhas vazias)")
-	}
-	return out, nil
-}
-
-func saveModel(path string, m *NBModel) error {
-	b, err := json.MarshalIndent(m, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, b, 0o644)
-}
-
-// -------------------- NB Treino/Inferência --------------------
-
-func TrainNB(samples []Sample, laplace float64, stop map[string]struct{}) *NBModel {
-	classCounts := map[string]int{}
-	tokenCounts := map[string]map[string]int{}
-	vocab := map[string]struct{}{}
-	totalTokensByClass := map[string]int{}
-
-	for _, s := range samples {
-		classCounts[s.Intent]++
-		if _, ok := tokenCounts[s.Intent]; !ok {
-			tokenCounts[s.Intent] = map[string]int{}
-		}
-		toks := tokenize(s.Text, stop)
-		for _, t := range toks {
-			tokenCounts[s.Intent][t]++
-			vocab[t] = struct{}{}
-			totalTokensByClass[s.Intent]++
-		}
-	}
-
-	classes := make([]string, 0, len(classCounts))
-	for c := range classCounts {
-		classes = append(classes, c)
-	}
-	sort.Strings(classes)
-
-	return &NBModel{
-		Classes:            classes,
-		ClassCounts:        classCounts,
-		TokenCounts:        tokenCounts,
-		Vocab:              vocab,
-		TotalTokensByClass: totalTokensByClass,
-		Laplace:            laplace,
-		Stopwords:          stop,
-	}
-}
-
-func Predict(m *NBModel, text string) (string, float64) {
-	toks := tokenize(text, m.Stopwords)
-
-	// prior por classe
-	totalDocs := 0
-	for _, c := range m.ClassCounts {
-		totalDocs += c
-	}
-
-	bestClass := ""
-	bestScore := math.Inf(-1)
-
-	V := float64(len(m.Vocab))
-
-	for _, class := range m.Classes {
-		logProb := math.Log(float64(m.ClassCounts[class]) / float64(totalDocs))
-		den := float64(m.TotalTokensByClass[class]) + m.Laplace*V
-
-		for _, t := range toks {
-			tc := float64(m.TokenCounts[class][t]) + m.Laplace
-			logProb += math.Log(tc / den)
-		}
-
-		if logProb > bestScore {
-			bestScore = logProb
-			bestClass = class
-		}
-	}
-	return bestClass, bestScore
-}
-
-// retorna: classe vencedora, probabilidade dela, margem (logTop1 - logTop2), mapa classe->prob
-func PredictProba(m *NBModel, text string) (string, float64, float64, map[string]float64) {
-	toks := tokenize(text, m.Stopwords)
-
-	totalDocs := 0
-	for _, c := range m.ClassCounts {
-		totalDocs += c
-	}
-	if totalDocs == 0 || len(m.Classes) == 0 {
-		return "", 0, 0, nil
-	}
-
-	V := float64(len(m.Vocab))
-	logScores := make([]float64, len(m.Classes))
-
-	// calcula log-scores
-	for i, class := range m.Classes {
-		logProb := math.Log(float64(m.ClassCounts[class]) / float64(totalDocs))
-		den := float64(m.TotalTokensByClass[class]) + m.Laplace*V
-		for _, t := range toks {
-			tc := float64(m.TokenCounts[class][t]) + m.Laplace
-			logProb += math.Log(tc / den)
-		}
-		logScores[i] = logProb
-	}
-
-	// encontra top1/top2 para margem
-	top1i, top2i := 0, 0
-	for i := 1; i < len(logScores); i++ {
-		if logScores[i] > logScores[top1i] {
-			top2i = top1i
-			top1i = i
-		} else if top1i == top2i || logScores[i] > logScores[top2i] {
-			top2i = i
-		}
-	}
-	margin := logScores[top1i] - logScores[top2i]
-
-	// normaliza com log-sum-exp -> probabilidades
-	maxLog := logScores[top1i]
-	var sumExp float64
-	for _, v := range logScores {
-		sumExp += math.Exp(v - maxLog)
-	}
-	probs := make(map[string]float64, len(m.Classes))
-	for i, c := range m.Classes {
-		probs[c] = math.Exp(logScores[i]-maxLog) / sumExp
-	}
-
-	winner := m.Classes[top1i]
-	return winner, probs[winner], margin, probs
-}
-
-func Evaluate(m *NBModel, test []Sample) (float64, map[string]map[string]int) {
-	if len(test) == 0 {
-		return 0, nil
-	}
-	cm := map[string]map[string]int{}
-	var correct int
-	for _, s := range test {
-		pred, _ := Predict(m, s.Text)
-		if pred == s.Intent {
-			correct++
-		}
-		if _, ok := cm[s.Intent]; !ok {
-			cm[s.Intent] = map[string]int{}
-		}
-		cm[s.Intent][pred]++
-	}
-	return float64(correct) / float64(len(test)), cm
-}
-
-func printConfusion(cm map[string]map[string]int) {
-	if cm == nil {
-		fmt.Println("sem dados de avaliação")
-		return
-	}
-	// coletar classes
-	classSet := map[string]struct{}{}
-	for g := range cm {
-		classSet[g] = struct{}{}
-		for p := range cm[g] {
-			classSet[p] = struct{}{}
-		}
-	}
-	var classes []string
-	for c := range classSet {
-		classes = append(classes, c)
-	}
-	sort.Strings(classes)
-
-	// header
-	fmt.Printf("%12s", "")
-	for _, c := range classes {
-		fmt.Printf("%12s", c)
-	}
-	fmt.Println()
-
-	for _, g := range classes {
-		fmt.Printf("%12s", g)
-		for _, p := range classes {
-			val := 0
-			if row, ok := cm[g]; ok {
-				val = row[p]
-			}
-			fmt.Printf("%12d", val)
-		}
-		fmt.Println()
-	}
-}
-
-// -------------------- NLP util --------------------
-
-var nonWord = regexp.MustCompile(`[^a-zA-Z0-9áàâãäéèêëíìîïóòôõöúùûüç]+`)
-
-func tokenize(s string, stop map[string]struct{}) []string {
-	s = strings.ToLower(s)
-	s = nonWord.ReplaceAllString(s, " ")
-	parts := strings.Fields(s)
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		if _, isStop := stop[p]; isStop {
-			continue
-		}
-		// normalizações simples
-		switch p {
-		case "pix", "pix.", "pix,":
-			p = "pix"
-		}
-		out = append(out, p)
-	}
-	return out
-}
-
-func buildStopwords() map[string]struct{} {
-	words := []string{
-		"o", "a", "os", "as", "de", "do", "da", "dos", "das", "um", "uma", "uns", "umas",
-		"é", "ser", "está", "tá", "pra", "para", "por", "porfavor", "favor", "por-favor",
-		"me", "eu", "vc", "você", "voce", "minha", "meu", "tem", "ter", "quero", "queria",
-		"pode", "poder", "por", "em", "no", "na", "nos", "nas", "com", "sem", "daí", "ai",
-		"the", "a", "an", "and", "or", "to", "of", "in", "on", "for", "please",
-	}
-	m := make(map[string]struct{}, len(words))
-	for _, w := range words {
-		m[w] = struct{}{}
-	}
-	return m
-}
-
-// -------------------- Entidades por regras (exemplos úteis p/ Pix) --------------------
-
-type Entities struct {
-	AmountBRL string   `json:"amount_brl,omitempty"`
-	Email     string   `json:"email,omitempty"`
-	PhoneBR   string   `json:"phone_br,omitempty"`
-	CPF       string   `json:"cpf,omitempty"`
-	CNPJ      string   `json:"cnpj,omitempty"`
-	PixKeys   []string `json:"pix_keys,omitempty"` // fallback com tudo que parece chave
-}
-
-var (
-	reAmount = regexp.MustCompile(`\b(\d{1,3}(\.\d{3})*|\d+)(,\d{2})?\b`) // 70, 1.200, 15,50
-	reEmail  = regexp.MustCompile(`[\w\.\-+]+@[\w\.\-]+\.[a-zA-Z]{2,}`)
-	rePhone  = regexp.MustCompile(`\b(?:\+?55)?\s?(?:\(?\d{2}\)?\s?)?\d{4,5}[\s\-]?\d{4}\b`)
-	reCPF    = regexp.MustCompile(`\b\d{3}\.?\d{3}\.?\d{3}\-?\d{2}\b`)
-	reCNPJ   = regexp.MustCompile(`\b\d{2}\.?\d{3}\.?\d{3}\/?\d{4}\-?\d{2}\b`)
-)
-
-func ExtractEntities(s string) Entities {
-	out := Entities{}
-	if m := reAmount.FindString(s); m != "" {
-		out.AmountBRL = m
-	}
-	if m := reEmail.FindString(s); m != "" {
-		out.Email = m
-	}
-	if m := rePhone.FindString(s); m != "" {
-		out.PhoneBR = m
-	}
-	if m := reCPF.FindString(s); m != "" {
-		out.CPF = m
-	}
-	if m := reCNPJ.FindString(s); m != "" {
-		out.CNPJ = m
-	}
-	// fallback: coleciona possíveis chaves (e-mail/telefone/cpf/cnpj já cobrem boa parte)
-	keys := map[string]struct{}{}
-	if out.Email != "" {
-		keys[out.Email] = struct{}{}
-	}
-	if out.PhoneBR != "" {
-		keys[out.PhoneBR] = struct{}{}
-	}
-	if out.CPF != "" {
-		keys[out.CPF] = struct{}{}
-	}
-	if out.CNPJ != "" {
-		keys[out.CNPJ] = struct{}{}
-	}
-	for k := range keys {
-		out.PixKeys = append(out.PixKeys, k)
-	}
-	return out
 }
